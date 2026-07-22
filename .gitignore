@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Datasets / raw & processed images (too large / privacy-sensitive for git)
+/dataset_pipeline/**/images/
+/dataset_pipeline/**/labels/
+/dataset_pipeline/**/*.zip
+/dataset_pipeline/03_test_100_annotation_reliability/blind_images/
+/dataset_pipeline/03_test_100_annotation_reliability/mapping_SECRET.csv
+/dataset_pipeline/03_test_100_annotation_reliability/agreement_detail.csv
+
+# Participant evaluation data (privacy)
+evaluation_data/
+*_calibration.csv
+*_yoga.csv
+
+# Statistical analysis: raw per-participant data (real names + face videos) and
+# the anonymization key must never be committed, only de-identified summaries
+/statistical_analysis/原始資料/
+/statistical_analysis/統計程式執行結果彙總.csv
+/statistical_analysis/**/test_batch*.jpg
+*.mp4
+
+# Local experiment outputs
+runs/
+!/model_training/yolov7/runs/
+!/model_training/yolov7/runs/**
+!/model_training/yolov9/runs/
+!/model_training/yolov9/runs/**
+*.onnx.tmp
