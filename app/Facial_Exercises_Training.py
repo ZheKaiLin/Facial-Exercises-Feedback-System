@@ -191,6 +191,13 @@ def draw_text_outline(frame, text, org, font, scale, color, thickness=2, outline
     會看起來像黑色文字與彩色文字重疊、錯位。
     因此這裡改用「同樣 thickness、不同座標偏移」來做描邊，
     避免中文文字出現重影。
+
+    效能注意：中文文字若逐一呼叫 cv2.putText 9 次（8 個描邊位移 + 1 個本體），
+    monkey-patch 過的中文版 cv2.putText 每次都要完整跑一輪 PIL 轉換
+    （裁切 ROI → BGR轉RGB → 畫字 → 轉回BGR → 貼回），等於一個帶外框的
+    中文標籤要做 9 次獨立 PIL 轉換；UI 一幀要畫幾十個標籤時，這是實測的
+    主要效能瓶頸。因此中文文字改成「只裁切一次、只轉換一次 PIL」，
+    9 層文字都畫在同一個 PIL 物件上才轉換貼回一次。
     """
     t = max(1, int(thickness))
     offsets = [
@@ -199,9 +206,38 @@ def draw_text_outline(frame, text, org, font, scale, color, thickness=2, outline
         (2, -2),  (2, 0),  (2, 2),
     ]
     x, y = int(org[0]), int(org[1])
+    text_s = str(text)
+
+    if Image is not None and ImageDraw is not None and _has_cjk(text_s):
+        (text_w, text_h), _ = _measure_cjk_text(text_s, font, scale, t)
+        y_top = y - text_h
+        pad = 8  # 6(原本內距) + 2(描邊位移範圍)
+        h_img, w_img = frame.shape[:2]
+        x1 = max(0, x - pad)
+        y1 = max(0, y_top - pad)
+        x2 = min(w_img, x + text_w + pad)
+        y2 = min(h_img, y_top + text_h + pad)
+        if x1 >= x2 or y1 >= y2:
+            return frame
+
+        roi = frame[y1:y2, x1:x2]
+        pil_roi = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_roi)
+        pil_font = _get_cjk_font(scale, t)
+        rgb_outline = (int(outline_color[2]), int(outline_color[1]), int(outline_color[0]))
+        rgb_color = (int(color[2]), int(color[1]), int(color[0]))
+
+        for dx, dy in offsets:
+            draw.text((x + dx - x1, y_top + dy - y1), text_s, font=pil_font, fill=rgb_outline)
+        draw.text((x - x1, y_top - y1), text_s, font=pil_font, fill=rgb_color)
+
+        frame[y1:y2, x1:x2] = cv2.cvtColor(np.array(pil_roi), cv2.COLOR_RGB2BGR)
+        return frame
+
     for dx, dy in offsets:
-        cv2.putText(frame, text, (x + dx, y + dy), font, scale, outline_color, t)
-    cv2.putText(frame, text, (x, y), font, scale, color, t)
+        cv2.putText(frame, text_s, (x + dx, y + dy), font, scale, outline_color, t)
+    cv2.putText(frame, text_s, (x, y), font, scale, color, t)
+    return frame
 
 
 
@@ -2072,6 +2108,9 @@ class FacialExercisesSystem:
             "Frown_Tighten_V": 0.03
         }
         self.calib_D0 = {}
+        # 個人化校準之原始基準值（margin 套用前），供評估流程即時計算動作幅度使用。
+        # 鍵："Face_Lift"、"Double_Chin"、"Frown_Tighten_H"、"Frown_Tighten_V"
+        self.calib_baseline = {}
         self.calib_confirm_time = None
         self.calib_confirm_duration = 1.5
         self.finish_time = None
@@ -2140,12 +2179,15 @@ class FacialExercisesSystem:
             return
 
         if exercise_name == "Face_Lift":
+            y0 = self.debug_vals["y_diff"]
+            self.calib_baseline["Face_Lift"] = y0
             # ×1.1：門檻放寬 10%（y_diff < thresh，門檻越高越容易達標）
-            self.custom_thresh["Face_Lift"] = (self.debug_vals["y_diff"] + 0.005) * 1.05
+            self.custom_thresh["Face_Lift"] = (y0 + 0.005) * 1.05
 
         elif exercise_name == "Double_Chin":
             D0 = self.debug_vals["m_height"]
             self.calib_D0["Double_Chin"] = max(D0, 1e-6)
+            self.calib_baseline["Double_Chin"] = D0
             # D0 × 0.95：向下寬鬆 5%（mouth > thresh，門檻越低越容易達標）
             self.custom_thresh["Double_Chin"] = D0 * 0.95
 
@@ -2154,6 +2196,8 @@ class FacialExercisesSystem:
             # 門檻直接等於放鬆基準值，只要皺眉使數值低於基準即視為達標。
             H0 = self.debug_vals["brow_h"]
             V0 = self.debug_vals["brow_v"]
+            self.calib_baseline["Frown_Tighten_H"] = H0
+            self.calib_baseline["Frown_Tighten_V"] = V0
             self.custom_thresh["Frown_Tighten_H"] = H0 * 1.0
             self.custom_thresh["Frown_Tighten_V"] = V0 * 1.0
 
@@ -3503,11 +3547,15 @@ class DataLogger:
         self.session        = session
         self.save_dir       = Path(save_dir) if save_dir else (SCRIPT_DIR / "evaluation_data")
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self._ts            = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._rounds        = []          # [{exercise, round, score, ts_achieved}]
         self._calibrations  = []          # [{exercise, baseline, threshold}]
         self._expr_rounds   = []          # [{expression, round_idx, score}]
+        self._amplitudes    = []          # [{exercise, round, amp_displacement, amp_mean_sustained, raw_extremum, duration_s, n_frames}]
         self.last_saved_path = None
+        # 同一個 session 內多個階段共用同一個 logger，save() 會被呼叫多次；
+        # 記錄每份清單上次成功寫入時的長度，長度沒變就不用重寫該檔案，
+        # 減少不必要的重複寫入（也降低撞到檔案短暫鎖定的機率）。
+        self._last_saved_len = {"rounds": 0, "expr": 0, "calib": 0, "amp": 0}
 
     # ── 記錄介面 ──────────────────────────────────────────────
     def log_calibration(self, exercise, baseline, threshold):
@@ -3538,30 +3586,80 @@ class DataLogger:
             "score":       round(float(score), 4),
         })
 
+    def log_amplitude(self, exercise, round_num, amp_displacement, amp_mean_sustained,
+                       raw_extremum, duration_s, n_frames):
+        """記錄「維持中」狀態即時量測之動作幅度（非事後由影片重建）。
+        對應論文回測腳本 round_amplitudes() 之同名欄位，唯此處數值來自
+        即時狀態機已知之真實回合起訖幀，非從影片以啟發式規則猜測回合邊界。
+        """
+        self._amplitudes.append({
+            "participant":         self.participant_id,
+            "session":             self.session,
+            "exercise":            exercise,
+            "round":               int(round_num),
+            "amp_displacement":    round(float(amp_displacement), 6),
+            "amp_mean_sustained":  round(float(amp_mean_sustained), 6),
+            "raw_extremum":        round(float(raw_extremum), 6),
+            "duration_s":          round(float(duration_s), 2),
+            "n_frames":            int(n_frames),
+        })
+
     # ── 儲存 ──────────────────────────────────────────────────
+    @staticmethod
+    def _write_csv_retry(path, fieldnames, rows, attempts=5, delay_s=0.3):
+        """寫入 CSV，遇到 PermissionError 時重試。
+
+        同一個 session（如 training）內有多個階段（表情訓練、臉部拉提、下顎線條）
+        共用同一個 DataLogger 實例，每個階段結束都會重新呼叫 save()、重寫全部
+        已累積的 CSV（包含前一階段已寫過的檔案）。Windows 上防毒軟體／OneDrive
+        常會在檔案剛寫入的瞬間短暫鎖住它，導致緊接著的第二次寫入撞到
+        PermissionError；這與資料內容或邏輯無關，重試即可解決。
+        """
+        import time as _time
+        last_err = None
+        for attempt in range(attempts):
+            try:
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    w = csv.DictWriter(f, fieldnames=fieldnames)
+                    w.writeheader(); w.writerows(rows)
+                return
+            except PermissionError as e:
+                last_err = e
+                if attempt < attempts - 1:
+                    print(f"[警告] 寫入 {path.name} 遇到權限錯誤，{delay_s:.1f}秒後重試"
+                          f"（第 {attempt + 1}/{attempts} 次）...")
+                    _time.sleep(delay_s)
+        raise last_err
+
     def save(self):
         saved = []
-        prefix = f"P{self.participant_id}_{self.session}_{self._ts}"
+        prefix = f"P{self.participant_id}_{self.session}"
 
-        if self._rounds:
+        if self._rounds and len(self._rounds) != self._last_saved_len["rounds"]:
             p = self.save_dir / f"{prefix}_exercises.csv"
-            with open(p, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=["participant", "session", "exercise", "round", "score", "Ts"])
-                w.writeheader(); w.writerows(self._rounds)
+            self._write_csv_retry(p, ["participant", "session", "exercise", "round", "score", "Ts"], self._rounds)
+            self._last_saved_len["rounds"] = len(self._rounds)
             saved.append(str(p))
 
-        if self._expr_rounds:
+        if self._expr_rounds and len(self._expr_rounds) != self._last_saved_len["expr"]:
             p = self.save_dir / f"{prefix}_expression.csv"
-            with open(p, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=["participant", "session", "expression", "round_idx", "score"])
-                w.writeheader(); w.writerows(self._expr_rounds)
+            self._write_csv_retry(p, ["participant", "session", "expression", "round_idx", "score"], self._expr_rounds)
+            self._last_saved_len["expr"] = len(self._expr_rounds)
             saved.append(str(p))
 
-        if self._calibrations:
+        if self._calibrations and len(self._calibrations) != self._last_saved_len["calib"]:
             p = self.save_dir / f"{prefix}_calibration.csv"
-            with open(p, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=["participant", "session", "exercise", "baseline", "threshold"])
-                w.writeheader(); w.writerows(self._calibrations)
+            self._write_csv_retry(p, ["participant", "session", "exercise", "baseline", "threshold"], self._calibrations)
+            self._last_saved_len["calib"] = len(self._calibrations)
+            saved.append(str(p))
+
+        if self._amplitudes and len(self._amplitudes) != self._last_saved_len["amp"]:
+            p = self.save_dir / f"{prefix}_amplitude.csv"
+            self._write_csv_retry(p, [
+                "participant", "session", "exercise", "round",
+                "amp_displacement", "amp_mean_sustained", "raw_extremum",
+                "duration_s", "n_frames"], self._amplitudes)
+            self._last_saved_len["amp"] = len(self._amplitudes)
             saved.append(str(p))
 
         if saved:
@@ -3646,6 +3744,9 @@ def run(
     participant="01",
     session="training",
     reps=10,
+    fps_log=None,
+    auto_exercise=None,
+    auto_duration=None,
 ):
     print("========== PROGRAM START ==========")
     print("ONNX CPU 模式")
@@ -3708,6 +3809,39 @@ def run(
     if view_img:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, WINDOW_W, WINDOW_H)
+
+    # ══════════════════════════════════════════════════════════
+    # 效能測速用鉤子（供論文 3.4 節「實際顯示吞吐量」量測，預設關閉，
+    # 不影響一般互動使用）：
+    #   fps_log      ：指定 CSV 路徑後，逐秒記錄視窗吞吐量（含 GUI 繪製與
+    #                   cv2.waitKeyEx 事件迴圈，是完整正式系統的真實 FPS）。
+    #   auto_exercise：略過主選單，開機直接進入指定運動項目，並在偵測到
+    #                   臉部對齊後自動完成校準（等同自動按下 C 鍵），完成
+    #                   一輪後自動重新開始，讓系統可在無人操作下持續運作。
+    #   auto_duration：經過此秒數後自動結束（等同自動按下 Q 鍵），供無人
+    #                   值守的背景測速使用。
+    # ══════════════════════════════════════════════════════════
+    _max_reps = reps  # reps 這個區域變數稍後會在迴圈內被 exercises_sys.analyze() 的回傳值覆寫，先保留原始上限
+    _run_start_time = time.perf_counter()
+    fps_csv_file = None
+    fps_csv_writer = None
+    fps_run_start = None
+    fps_window_start = None
+    fps_window_frames = 0
+    fps_total_frames = 0
+    if fps_log:
+        fps_csv_file = open(fps_log, "w", newline="", encoding="utf-8")
+        fps_csv_writer = csv.writer(fps_csv_file)
+        fps_csv_writer.writerow(["elapsed_s", "frame_idx", "window_fps"])
+        fps_run_start = time.perf_counter()
+        fps_window_start = fps_run_start
+
+    auto_aligned_streak = 0
+    if auto_exercise:
+        current_exercise = auto_exercise
+        exercises_sys = FacialExercisesSystem()
+        exercises_sys.max_reps = _max_reps
+        current_screen = "exercises_TRAINING"
 
     while True:
         ret, frame = cap.read()
@@ -3884,9 +4018,44 @@ def run(
                 exercises_sys.rest_duration
             )
 
+            # --- 自動測速模式：等同自動按 C 完成校準、FINISHED 後自動重來 ---
+            if auto_exercise:
+                if exercises_sys.state == "校正":
+                    if dbg.get("is_aligned", False):
+                        auto_aligned_streak += 1
+                    else:
+                        auto_aligned_streak = 0
+                    if auto_aligned_streak >= 30:  # 約1秒(30幀)持續對齊後自動校準
+                        exercises_sys.confirm_calibration(current_exercise)
+                        auto_aligned_streak = 0
+                elif state == "FINISHED":
+                    exercises_sys = FacialExercisesSystem()
+                    exercises_sys.max_reps = _max_reps
+                    prev_exercises_state = None
+                    prev_target_reached = False
+                    prev_prep_ceil = None
+                    auto_aligned_streak = 0
+
         if view_img:
             cv2.imshow(window_name, resize_for_window(im0))
             key = cv2.waitKeyEx(1)
+
+            # --- FPS 測速記錄（含GUI繪製與事件迴圈，逐秒記錄一次視窗吞吐量）---
+            if fps_log:
+                fps_total_frames += 1
+                fps_window_frames += 1
+                _now = time.perf_counter()
+                if _now - fps_window_start >= 1.0:
+                    _window_fps = fps_window_frames / (_now - fps_window_start)
+                    fps_csv_writer.writerow([
+                        round(_now - fps_run_start, 2), fps_total_frames, round(_window_fps, 2)
+                    ])
+                    fps_csv_file.flush()
+                    fps_window_start = _now
+                    fps_window_frames = 0
+
+            if auto_duration and (time.perf_counter() - _run_start_time) >= auto_duration:
+                break
 
             if key_pressed(key, "q") or key == 27:
                 break
@@ -3939,6 +4108,9 @@ def run(
 
     cap.release()
     cv2.destroyAllWindows()
+    if fps_csv_file:
+        fps_csv_file.close()
+        print(f"FPS 記錄已存至：{fps_log}")
 
 
 def parse_opt():
@@ -4008,6 +4180,28 @@ def parse_opt():
         type=int,
         default=10,
         help="每項運動最多回合數（前後測建議設 3）"
+    )
+
+    parser.add_argument(
+        "--fps-log",
+        type=str,
+        default=None,
+        help="供效能測速用：指定CSV路徑後，逐秒記錄含GUI繪製之真實視窗吞吐量FPS"
+    )
+
+    parser.add_argument(
+        "--auto-exercise",
+        type=str,
+        default=None,
+        choices=["Face_Lift", "Double_Chin", "Frown_Tighten"],
+        help="供效能測速用：略過主選單直接進入指定運動項目，偵測到臉部對齊後自動校準、完成後自動重來"
+    )
+
+    parser.add_argument(
+        "--auto-duration",
+        type=float,
+        default=None,
+        help="供效能測速用：經過此秒數後自動結束程式，供無人值守之背景測速"
     )
 
     opt = parser.parse_args()

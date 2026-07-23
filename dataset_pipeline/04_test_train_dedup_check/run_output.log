@@ -1,0 +1,10 @@
+測試集（test_300）：300 張
+訓練集（train）：2172 張
+計算訓練集 MD5 / pHash ...
+計算測試集 MD5 / pHash 並逐一比對 ...
+
+===== 比對結果摘要 =====
+MD5 完全相同（位元組級重複）：0 組
+pHash 疑似重複（漢明距離 <= 26）：0 組
+整體雜湊距離最接近的配對：test/1517.png vs train/1720.png，漢明距離 = 60 / 256 bits（差異約 23.4%）
+詳細報告已輸出：C:\Users\林哲楷\Desktop\Facial-Exercises-Detection-System\dataset_pipeline\04_test_train_dedup_check\duplicate_report.csv

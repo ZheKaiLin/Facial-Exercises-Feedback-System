@@ -1,21 +1,4 @@
-"""
-Facial_exercises_Evaluation.py
-臉部運動系統評估流程自動化腳本
 
-執行方式：
-    python Facial_exercises_Evaluation.py
-    或直接雙擊打包後的 FacialexercisesEval.exe
-
-評估流程（自動依序執行，資料分開存檔）：
-    ① 前測  — 臉部拉提 3 回合    → P01_pre_test_..._exercises.csv
-    ② 前測  — 下顎線條 3 回合    ↗
-    ③ 系統說明 — 研究者口頭說明，按空白鍵繼續
-    ④ 訓練  — 表情訓練 2 輪×5   → P01_training_..._expression.csv
-    ⑤ 訓練  — 臉部拉提 3 回合    → P01_training_..._exercises.csv
-    ⑥ 訓練  — 下顎線條 3 回合    ↗
-    ⑦ 後測  — 臉部拉提 3 回合    → P01_post_test_..._exercises.csv
-    ⑧ 後測  — 下顎線條 3 回合    ↗
-"""
 
 import sys, re, time, math
 from pathlib import Path
@@ -64,7 +47,7 @@ def _auto_participant_id(save_dir: Path) -> str:
     """掃描既有前測 CSV，自動產生下一組受試者編號（01, 02, …）。"""
     save_dir.mkdir(parents=True, exist_ok=True)
     nums = []
-    for f in save_dir.glob("P*_pre_test_*_exercises.csv"):
+    for f in save_dir.glob("P*_pre_test_exercises.csv"):
         m = re.match(r"P(\d+)_", f.name)
         if m:
             nums.append(int(m.group(1)))
@@ -264,13 +247,14 @@ def _pretest_calibrate(exercises_sys, exercise):
     """前後測使用寬鬆門檻自動校準，不需要使用者手動按 C。"""
     dbg = exercises_sys.debug_vals
     if exercise == "Face_Lift":
-        # 前後測：× 1.05，寬鬆 5%
-        exercises_sys.custom_thresh["Face_Lift"] = (dbg.get("y_diff", 0.02) + 0.005) * 1.05
+        y0 = dbg.get("y_diff", 0.02)
+        exercises_sys.calib_baseline["Face_Lift"] = y0
+        exercises_sys.custom_thresh["Face_Lift"] = (y0 + 0.005) * 1
     elif exercise == "Double_Chin":
         D0 = dbg.get("m_height", 0.03)
         exercises_sys.calib_D0["Double_Chin"] = max(D0, 1e-6)
-        # 前後測：× 0.95，寬鬆 5%
-        exercises_sys.custom_thresh["Double_Chin"] = D0 * 0.95
+        exercises_sys.calib_baseline["Double_Chin"] = D0
+        exercises_sys.custom_thresh["Double_Chin"] = D0 * 1
     exercises_sys.calib_confirm_time = time.time()
     exercises_sys.is_calibrated = True
     exercises_sys.state = "START"
@@ -333,14 +317,14 @@ def evaluation_run(weights=None, source="0"):
     sound_mgr = SoundManager()
 
     # ── 錄影輔助 ──────────────────────────────────────────────
-    _rec_ts   = time.strftime("%Y%m%d_%H%M%S")
+  
     _fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
     _rec_fps  = 25.0
     _rec_size = (DISPLAY_W, DISPLAY_H)
 
     def _start_rec(session, label):
         """開啟新的 VideoWriter，回傳物件。"""
-        fname = save_dir / f"P{auto_pid}_{session}_{label}_{_rec_ts}.mp4"
+        fname = save_dir / f"P{auto_pid}_{session}_{label}.mp4"
         vw = cv2.VideoWriter(str(fname), _fourcc, _rec_fps, _rec_size)
         print(f"[錄影開始] {fname.name}")
         return vw
@@ -367,6 +351,12 @@ def evaluation_run(weights=None, source="0"):
     phase_logged     = False
     phase_saved_path = None
     phase_done_time  = None
+
+    # ── 即時動作幅度追蹤──────────────────────
+    # 「維持中」狀態逐幀收集當下幾何訊號，回合完成（reps 增加）時結算峰值/平均值，
+    amp_buffer            = []
+    amp_round_start_time  = None
+    prev_reps_for_amp     = 0
 
     while True:
         ret, frame = cap.read()
@@ -403,6 +393,7 @@ def evaluation_run(weights=None, source="0"):
                 expr_started = False
                 phase_logged = False
                 prev_exercises_state = prev_prep_ceil = None
+                amp_buffer, amp_round_start_time, prev_reps_for_amp = [], None, 0
                 # 開始錄影
                 _stop_rec(video_writer)
                 s, _, ex, _, _ = phase
@@ -420,7 +411,6 @@ def evaluation_run(weights=None, source="0"):
                 exercise, im0, yolo_results,
                 mp_frame=frame, mp_offset=(pad_x, pad_y), mp_scale=disp_scale)
 
-            # 前後測：臉部對齊後自動套用寬鬆門檻（不需使用者按 C）
             if session in ("pre_test", "post_test") and state == "校正":
                 if exercises_sys.debug_vals.get("is_aligned", False):
                     _pretest_calibrate(exercises_sys, exercise)
@@ -430,6 +420,37 @@ def evaluation_run(weights=None, source="0"):
             dbg["exercise_display"] = name
 
             is_tr = dbg.get("is_target_reached", False)
+
+            # ── 即時動作幅度收集：狀態機精確掌握「維持中」真實起訖幀，
+            # 逐幀收集當下幾何訊號，回合完成（reps 增加）時直接結算峰值/平均值，
+            
+            if state == "維持中":
+                if prev_exercises_state != "維持中":
+                    amp_buffer = []
+                    amp_round_start_time = time.time()
+                raw_val = dbg.get("y_diff") if exercise == "Face_Lift" else dbg.get("m_height")
+                if raw_val is not None:
+                    amp_buffer.append(float(raw_val))
+
+            if exercises_sys.reps != prev_reps_for_amp:
+                # reps 剛增加：代表上一回合為「有效記錄」（Tₛ=0 之重做回合不會使 reps 增加，
+                # amp_buffer 會在下次重新進入「維持中」時自然被清空，不會誤記為有效回合）
+                baseline = exercises_sys.calib_baseline.get(exercise)
+                if baseline is not None and amp_buffer:
+                    buf = np.asarray(amp_buffer, dtype=float)
+                    if exercise == "Face_Lift":
+                        extremum = float(np.min(buf))
+                        amp      = max(baseline - extremum, 0.0)
+                        amp_mean = max(baseline - float(np.mean(buf)), 0.0)
+                    else:  # Double_Chin
+                        extremum = float(np.max(buf))
+                        amp      = max(extremum - baseline, 0.0)
+                        amp_mean = max(float(np.mean(buf)) - baseline, 0.0)
+                    duration = (time.time() - amp_round_start_time) if amp_round_start_time else 0.0
+                    loggers[session].log_amplitude(
+                        exercise, exercises_sys.reps, amp, amp_mean, extremum, duration, len(buf))
+                amp_buffer = []
+                prev_reps_for_amp = exercises_sys.reps
 
             if state != prev_exercises_state:
                 if state == "準備中":     prev_prep_ceil = None
@@ -533,6 +554,7 @@ def evaluation_run(weights=None, source="0"):
                 expr_started = False
                 phase_logged = False
                 prev_exercises_state = prev_prep_ceil = None
+                amp_buffer, amp_round_start_time, prev_reps_for_amp = [], None, 0
                 # Enter 提前開始也要啟動錄影
                 _stop_rec(video_writer)
                 s, _, ex, _, _ = phase
