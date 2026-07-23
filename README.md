@@ -73,14 +73,14 @@ Facial-Exercises-Detection-System/
 
 | 部分 | Python 版本 | 說明 |
 |---|---|---|
-| `app/`（臉部運動系統） | **3.9** | 開發/測試時實際使用的版本 |
+| `app/`（臉部運動系統） | **3.11** | 開發/測試時實際使用的版本 |
 | `model_training/yolov7/` | **3.12** | YOLOv7 官方 repo 所需套件版本 |
 | `model_training/yolov9/` | **3.12** | YOLOv9 官方 repo 所需套件版本 |
 
 **臉部運動系統（`app/`）**：
 
 ```bash
-py -3.9 -m venv venv
+py -3.11 -m venv venv
 venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 ```
