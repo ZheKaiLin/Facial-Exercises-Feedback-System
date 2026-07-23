@@ -42,8 +42,6 @@ Facial-Exercises-Detection-System/
 ├── model_training/                        # 2. YOLO 模型訓練
 │   ├── yolov7/
 │   │   ├── face_dataset*.yaml             # 資料集設定（train/val/test 路徑、類別）
-│   │   ├── make_5_balanced_data.py
-│   │   ├── run.py                          # PyTorch 版即時系統（需搭配完整 YOLOv7 原始碼）
 │   │   ├── commands.txt                    # 訓練/驗證/測試/匯出 ONNX 指令與各 batch size mAP 結果
 │   │   └── runs/                           # 訓練/驗證/測試紀錄（圖表、log；權重檔另見雲端連結）
 │   └── yolov9/
